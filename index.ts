@@ -267,7 +267,7 @@ async function describeImage(
     }
   })();
 
-  // LRU eviction
+  // FIFO eviction (oldest entry evicted when cache is full)
   if (descriptionCache.size >= CACHE_MAX) {
     const firstKey = descriptionCache.keys().next().value;
     if (firstKey !== undefined) descriptionCache.delete(firstKey);
@@ -424,6 +424,7 @@ async function handleCommand(ctx: ExtensionCommandContext, args: string): Promis
       [
         "pi-dvision commands:",
         "  /dvision                       Show status",
+        "  /dvision status               Same as /dvision",
         "  /dvision model <provider/id>   Set the vision model",
         "  /dvision enable                Enable vision handoff",
         "  /dvision disable               Disable vision handoff",
