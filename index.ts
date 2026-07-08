@@ -103,8 +103,7 @@ function isHandoffTarget(
   model: { provider?: string; id?: string; input?: ("text" | "image")[] } | undefined | null,
 ): boolean {
   if (!model || !model.provider || !model.id) return false;
-  const ref = formatModelRef(model.provider, model.id);
-  // handoffModels list not needed in minimal version — autoHandoff covers it.
+  // autoHandoff: describe images for every model whose input does not include "image".
   if (config.autoHandoff && !isVisionModel(model)) return true;
   return false;
 }
@@ -193,7 +192,16 @@ function resolveVisionModel(
   return modelRegistry.find(parsed.provider, parsed.id) ?? null;
 }
 
-/** Describe one image via completeSimple(). Cached per hash. */
+/** Describe one image via completeSimple(). Cached per hash.
+ *
+ *  Cache contract: successes are cached (same image → same description, no
+ *  repeat call); failures (UNAVAILABLE) are NOT cached so the next turn
+ *  re-attempts — a broken vision model or a transient auth error shouldn't
+ *  permanently mark an image as undescribable for the session.
+ *
+ *  In-flight dedup: concurrent callers for the same hash share one promise
+ *  (the in-flight entry is set synchronously before the first await resolves).
+ *  Once it settles, a failure is evicted; a success stays for cache hits. */
 async function describeImage(
   img: ExtractedImage,
   modelRegistry: { find: (provider: string, id: string) => Model<Api> | undefined; getApiKeyAndHeaders: (model: Model<Api>) => Promise<{ ok: boolean; apiKey?: string; headers?: Record<string, string>; error?: string }> },
@@ -202,6 +210,12 @@ async function describeImage(
   const hash = imageHash(img.mimeType, img.data);
   const cached = descriptionCache.get(hash);
   if (cached) return cached;
+
+  // FIFO eviction (oldest entry evicted when cache is full)
+  if (descriptionCache.size >= CACHE_MAX) {
+    const firstKey = descriptionCache.keys().next().value;
+    if (firstKey !== undefined) descriptionCache.delete(firstKey);
+  }
 
   const promise = (async (): Promise<string> => {
     const visionModel = resolveVisionModel(modelRegistry);
@@ -236,7 +250,8 @@ async function describeImage(
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 120_000);
-      if (signal) signal.addEventListener("abort", () => controller.abort(), { once: true });
+      const onAbort = () => controller.abort();
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
       const response = await completeSimple(
         visionModel,
@@ -249,6 +264,7 @@ async function describeImage(
         },
       );
       clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
 
       if (response.stopReason === "aborted" || response.stopReason === "error") {
         return UNAVAILABLE;
@@ -267,12 +283,11 @@ async function describeImage(
     }
   })();
 
-  // FIFO eviction (oldest entry evicted when cache is full)
-  if (descriptionCache.size >= CACHE_MAX) {
-    const firstKey = descriptionCache.keys().next().value;
-    if (firstKey !== undefined) descriptionCache.delete(firstKey);
-  }
   descriptionCache.set(hash, promise);
+  // Evict failures so the next turn re-attempts. Successes stay cached.
+  promise.then((result) => {
+    if (result === UNAVAILABLE) descriptionCache.delete(hash);
+  });
   return promise;
 }
 
@@ -312,14 +327,18 @@ export default function (pi: ExtensionAPI) {
     const descs = await describeImages(imgs, ctx);
     if (ctx.signal?.aborted) return;
 
-    // Strip pi's non-vision note + swap image blocks for descriptions.
-    const next = content.slice();
+    // Insert description BEFORE each image block, KEEP the image block (so
+    // kitty renders it inline and /resume retains it). pi-ai's
+    // downgradeUnsupportedImages strips image blocks for non-vision models
+    // later, but the inserted text reaches the model untouched.
+    // Also strip pi's non-vision note — it's misleading once we add a description.
+    const next: (TextContent | ImageContent)[] = [];
     let changed = false;
     let descIdx = 0;
-    for (let i = 0; i < next.length; i++) {
-      const block = next[i];
+    for (const block of content) {
       if (extractImageFromBlock(block)) {
-        next[i] = { type: "text", text: descs[descIdx++] ?? UNAVAILABLE } satisfies TextContent;
+        next.push({ type: "text", text: descs[descIdx++] ?? UNAVAILABLE } satisfies TextContent);
+        next.push(block as ImageContent);
         changed = true;
       } else if (
         typeof block === "object" &&
@@ -327,11 +346,13 @@ export default function (pi: ExtensionAPI) {
         typeof (block as { text: string }).text === "string" &&
         (block as { text: string }).text.includes(NON_VISION_IMAGE_NOTE)
       ) {
-        next[i] = { type: "text", text: stripNonVisionImageNote((block as { text: string }).text) } satisfies TextContent;
+        next.push({ type: "text", text: stripNonVisionImageNote((block as { text: string }).text) } satisfies TextContent);
         changed = true;
+      } else {
+        next.push(block as TextContent | ImageContent);
       }
     }
-    if (changed) return { content: next as (TextContent | ImageContent)[] };
+    if (changed) return { content: next };
   });
 
   // FALLBACK injection: context event (catches user-attached, pasted images).
